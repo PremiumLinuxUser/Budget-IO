@@ -1,0 +1,8 @@
+# Never commit real financial data to a public repo.
+*.csv
+!samples/sample-transactions.csv
+budget-io-backup*.json
+*.ofx
+*.qfx
+.DS_Store
+node_modules/
