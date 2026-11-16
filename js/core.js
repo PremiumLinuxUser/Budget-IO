@@ -118,7 +118,7 @@
     ['Groceries', ['grocery', 'kroger', 'safeway', 'whole foods', 'trader joe', 'aldi', 'publix', 'walmart', 'costco', 'wegmans', 'heb ', 'sprouts', 'market']],
     ['Dining', ['restaurant', 'cafe', 'coffee', 'starbucks', 'mcdonald', 'chipotle', 'pizza', 'burger', 'doordash', 'uber eats', 'grubhub', 'taco', 'sushi', 'bar & grill', 'diner', 'dunkin']],
     ['Transport', ['uber', 'lyft', 'shell', 'chevron', 'exxon', 'bp ', 'fuel', 'gas station', 'parking', 'transit', 'metro', 'toll', 'auto parts', 'geico', 'progressive ins']],
-    ['Shopping', ['amazon', 'target', 'best buy', 'ebay', 'etsy', 'nike', 'ikea', 'apple store', 'macy', 'old navy']],
+    ['Shopping', ['amazon', 'target', 'best buy', 'ebay', 'etsy', 'nike', 'ikea', 'apple store', "macy's", 'macys', 'old navy']],
     ['Entertainment', ['cinema', 'theater', 'theatre', 'amc', 'steam', 'playstation', 'xbox', 'concert', 'ticketmaster', 'bowling']],
     ['Subscriptions', ['netflix', 'spotify', 'hulu', 'disney', 'youtube', 'prime video', 'hbo', 'apple.com/bill', 'icloud', 'patreon', 'subscription', 'adobe', 'dropbox', 'gym', 'fitness']],
     ['Health', ['pharmacy', 'cvs', 'walgreens', 'doctor', 'dental', 'clinic', 'hospital', 'medical', 'vision', 'health']],
@@ -289,8 +289,100 @@
     return round2(r === 0 ? principal / n : (principal * r) / (1 - Math.pow(1 + r, -n)));
   }
 
+  /* ---------- Subscriptions / recurring charges ---------- */
+
+  const CADENCES = {
+    weekly: { label: 'Weekly', perMonth: 52 / 12, days: 7 },
+    monthly: { label: 'Monthly', perMonth: 1, days: 31 },
+    quarterly: { label: 'Quarterly', perMonth: 1 / 3, days: 92 },
+    yearly: { label: 'Yearly', perMonth: 1 / 12, days: 366 },
+  };
+  const dayNum = (iso) => { const [y, m, d] = iso.split('-').map(Number); return Math.round(Date.UTC(y, m - 1, d) / 864e5); };
+  const fromDayNum = (n) => { const d = new Date(n * 864e5); return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`; };
+  const daysBetween = (a, b) => dayNum(b) - dayNum(a);
+  const addDays = (iso, n) => fromDayNum(dayNum(iso) + n);
+  function addMonthsClamped(iso, n) {
+    const [, , d] = iso.split('-').map(Number);
+    const ym = addMonths(iso.slice(0, 7), n), [yy, mm] = ym.split('-').map(Number);
+    return `${ym}-${pad(Math.min(d, new Date(Date.UTC(yy, mm, 0)).getUTCDate()))}`;
+  }
+  /** The k-th charge date of a series anchored at `base` (k = 0 is the base itself). Computed from the anchor so month-ends don't drift. */
+  function nthCharge(base, cadence, k) {
+    return cadence === 'weekly' ? addDays(base, 7 * k) : addMonthsClamped(base, k * (cadence === 'monthly' ? 1 : cadence === 'quarterly' ? 3 : 12));
+  }
+  /** First charge date in the series that is on or after `from`. */
+  function nextCharge(base, cadence, from) {
+    for (let k = 0; k < 5000; k++) { const d = nthCharge(base, cadence, k); if (d >= from) return d; }
+    return base;
+  }
+  /** All charge dates in [from, to]. */
+  function chargesBetween(base, cadence, from, to) {
+    const out = [];
+    for (let k = 0; k < 5000; k++) { const d = nthCharge(base, cadence, k); if (d > to) break; if (d >= from) out.push(d); }
+    return out;
+  }
+  const monthlyCost = (amount, cadence) => round2(amount * (CADENCES[cadence] || CADENCES.monthly).perMonth);
+
+  // Categories that are normally variable spending or non-subscription flows; recurring detection ignores them.
+  const NOT_SUBSCRIPTIONS = new Set(['Transfer', 'Income', 'Housing', 'Debt Payments', 'Savings', 'Groceries', 'Dining', 'Transport', 'Travel']);
+
+  function median(a) { const s = [...a].sort((x, y) => x - y), m = Math.floor(s.length / 2); return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
+  function cadenceForGap(g, n) {
+    if (g >= 5 && g <= 9 && n >= 3) return 'weekly';
+    if (g >= 26 && g <= 35) return 'monthly';
+    if (g >= 80 && g <= 100) return 'quarterly';
+    if (g >= 340 && g <= 390) return 'yearly';
+    return null;
+  }
+
+  /**
+   * Find charges that repeat at a steady interval for a similar amount.
+   * Returns [{key, name, amount, cadence, count, lastDate, nextDate, monthlyCost, category, active}].
+   */
+  function detectRecurring(txns, today) {
+    const groups = {};
+    for (const t of txns) {
+      if (t.amount >= 0 || NOT_SUBSCRIPTIONS.has(t.category)) continue;
+      const key = merchantKey(t.desc);
+      if (key.length < 3) continue;
+      (groups[key] ||= []).push(t);
+    }
+    const found = [];
+    for (const [key, list] of Object.entries(groups)) {
+      if (list.length < 2) continue;
+      // keep the most common amount cluster (within 10% or $1), so a one-off different charge doesn't hide the pattern
+      let best = [];
+      for (const t of list) {
+        const tol = Math.max(1, Math.abs(t.amount) * 0.1);
+        const near = list.filter((o) => Math.abs(Math.abs(o.amount) - Math.abs(t.amount)) <= tol);
+        if (near.length > best.length) best = near;
+      }
+      if (best.length < 2) continue;
+      // two charges is thin evidence: only accept it when the amounts are essentially identical (like a real subscription)
+      if (best.length === 2 && Math.abs(Math.abs(best[0].amount) - Math.abs(best[1].amount)) > Math.max(0.5, Math.abs(best[0].amount) * 0.01)) continue;
+      best.sort((a, b) => a.date.localeCompare(b.date));
+      const dates = [...new Set(best.map((t) => t.date))];
+      if (dates.length < 2) continue;
+      const gaps = dates.slice(1).map((d, i) => daysBetween(dates[i], d));
+      const med = median(gaps), cadence = cadenceForGap(med, dates.length);
+      if (!cadence) continue;
+      const steady = gaps.filter((g) => Math.abs(g - med) <= Math.max(4, med * 0.2)).length / gaps.length;
+      if (steady < 0.6) continue;
+      const last = best[best.length - 1], lastDate = dates[dates.length - 1];
+      const amount = round2(Math.abs(last.amount));
+      const active = daysBetween(lastDate, today) <= CADENCES[cadence].days * 1.6;
+      found.push({
+        key, name: last.desc, amount, cadence, count: dates.length, lastDate, category: last.category, active,
+        nextDate: active ? nextCharge(lastDate, cadence, today > lastDate ? today : addDays(lastDate, 1)) : null,
+        monthlyCost: monthlyCost(amount, cadence),
+      });
+    }
+    return found.sort((a, b) => b.monthlyCost - a.monthlyCost);
+  }
+
   return {
     parseCSV, detectColumns, parseAmount, parseDate, categorize, merchantKey, rowsToTransactions, txnKey,
+    CADENCES, detectRecurring, nextCharge, chargesBetween, monthlyCost, daysBetween, addDays,
     CATEGORIES, monthOf, addMonths, monthlyReport, payoffPlan, splitPayment, loanPayment, round2,
   };
 });

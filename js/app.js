@@ -36,7 +36,7 @@
 
   /* ---------- state ---------- */
   const KEY = 'budgetio.v1';
-  const blank = () => ({ transactions: [], buckets: [], debts: [], rules: {}, budgets: {}, settings: { extra: 0, strategy: 'avalanche' } });
+  const blank = () => ({ transactions: [], buckets: [], debts: [], subs: [], ignoredSubs: [], rules: {}, budgets: {}, settings: { extra: 0, strategy: 'avalanche' } });
   let state = blank();
 
   /* Optional passphrase lock: AES-256-GCM, key derived with PBKDF2 (WebCrypto). The key lives only in memory. */
@@ -204,7 +204,7 @@
   }
 
   /* ---------- views ---------- */
-  const views = { dashboard: vDashboard, transactions: vTransactions, buckets: vBuckets, reports: vReports, debts: vDebts };
+  const views = { dashboard: vDashboard, transactions: vTransactions, buckets: vBuckets, subscriptions: vSubscriptions, reports: vReports, debts: vDebts };
 
   function render() {
     $$('#tabs button').forEach((b) => (b.getAttribute('data-tab') === ui.tab ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current')));
@@ -223,7 +223,7 @@
   }
   function go(tab) { ui.tab = tab; render(); window.scrollTo(0, 0); try { history.replaceState(null, '', '#' + tab); } catch { /* ignore */ } }
 
-  const isEmpty = () => !state.transactions.length && !state.buckets.length && !state.debts.length;
+  const isEmpty = () => !state.transactions.length && !state.buckets.length && !state.debts.length && !(state.subs || []).length;
 
   function emptyHero() {
     return `<div class="card empty"><h3>Welcome to Budget IO 👋</h3><p>Upload a CSV from your bank to see where your money goes, set up savings buckets, and map out debt payoff.</p>
@@ -326,6 +326,49 @@
         <div class="milestone">${milestone(p)}</div>
         <div class="muted" style="font-size:.85rem">${left > 0 ? `${money0(left)} to go` : 'Fully funded'}${months ? ` · at ${money0(b.monthly)}/mo → ${inMonths(months)}` : ''}</div>
         <div class="actions"><button class="btn primary sm" data-action="deposit" data-id="${b.id}">＋ Deposit</button><button class="btn sm" data-action="withdraw" data-id="${b.id}">Withdraw</button><button class="btn sm" data-action="edit-bucket" data-id="${b.id}">Edit</button></div></div></section>`;
+  }
+
+
+  /* subscriptions */
+  const CADENCE_OPTS = (sel) => Object.entries(C.CADENCES).map(([k, v]) => `<option value="${k}" ${k === sel ? 'selected' : ''}>${v.label}</option>`).join('');
+  const cadenceLabel = (c) => (C.CADENCES[c] || C.CADENCES.monthly).label.toLowerCase();
+  const dueIn = (iso) => { const n = C.daysBetween(todayISO(), iso); return n === 0 ? 'today' : n === 1 ? 'tomorrow' : n < 0 ? `${-n} days ago` : `in ${n} days`; };
+  const normName = (s) => C.merchantKey(s) || String(s).toLowerCase();
+
+  function detectedSubs() {
+    const tracked = new Set(state.subs.map((x) => x.key || normName(x.name)));
+    const ignored = new Set(state.ignoredSubs || []);
+    return C.detectRecurring(state.transactions, todayISO()).filter((d) => !tracked.has(d.key) && !ignored.has(d.key));
+  }
+
+  function vSubscriptions() {
+    const today = todayISO(), horizon = C.addDays(today, 30);
+    const active = state.subs.filter((x) => x.status !== 'cancelled'), cancelled = state.subs.filter((x) => x.status === 'cancelled');
+    const monthly = active.reduce((s, x) => s + C.monthlyCost(x.amount, x.cadence), 0);
+    const upcoming = active.flatMap((x) => C.chargesBetween(x.nextDate, x.cadence, today, horizon).map((d) => ({ x, d })));
+    const dueTotal = upcoming.reduce((s, u) => s + u.x.amount, 0);
+    const saved = cancelled.reduce((s, x) => s + C.monthlyCost(x.amount, x.cadence), 0) * 12;
+    const detected = detectedSubs();
+    const head = `<div class="page-head"><h1>Subscriptions</h1><div class="head-tools"><button class="btn primary" data-action="add-sub">＋ Add subscription</button></div></div>`;
+    if (!state.subs.length && !detected.length) return `${head}<div class="card empty"><h3>Find your recurring charges 🔁</h3><p>Upload a few months of transactions and Budget IO will spot subscriptions automatically (Netflix, gym, software…), or add them by hand with their billing date.</p>
+      <button class="btn primary" data-action="import">⬆ Upload a CSV</button><button class="btn" data-action="add-sub">＋ Add one manually</button><button class="btn" data-action="sample">✨ Load sample data</button></div>`;
+    const rows = [...active].sort((a, b) => C.nextCharge(a.nextDate, a.cadence, today).localeCompare(C.nextCharge(b.nextDate, b.cadence, today)));
+    return `${head}
+      <div class="tiles">${tile('Monthly cost', money(monthly), `${active.length} active`)}${tile('Yearly cost', money0(monthly * 12), 'if nothing changes', 'neg')}
+        ${tile('Due in 30 days', money(dueTotal), `${upcoming.length} charge${upcoming.length === 1 ? '' : 's'}`)}${tile('Saved by cancelling', money0(saved), 'per year')}</div>
+      ${detected.length ? `<section class="card" style="margin-bottom:16px"><div class="card-head"><div><h2>Found in your transactions</h2><div class="muted" style="font-size:.85rem">Repeating charges at a steady interval. Add the ones you want to keep an eye on.</div></div><button class="btn sm" data-action="track-all">Track all (${detected.length})</button></div>
+        <div class="table-wrap"><table><tbody>${detected.map((d) => `<tr><td><b>${esc(d.name)}</b>${d.active ? '' : ' <span class="pill warn">maybe cancelled</span>'}<div class="muted" style="font-size:.8rem">${d.count} charges · last ${dateLabel(d.lastDate)}</div><div class="show-sm"><button class="btn sm primary" data-action="track-sub" data-key="${esc(d.key)}">Track</button><button class="btn sm" data-action="ignore-sub" data-key="${esc(d.key)}">Ignore</button></div></td>
+          <td class="r num">${money(d.amount)}<div class="muted" style="font-size:.8rem">${cadenceLabel(d.cadence)}</div></td>
+          <td class="r acts hide-sm"><button class="btn sm primary" data-action="track-sub" data-key="${esc(d.key)}">Track</button> <button class="btn sm" data-action="ignore-sub" data-key="${esc(d.key)}" title="Not a subscription">Ignore</button></td></tr>`).join('')}</tbody></table></div></section>` : ''}
+      <section class="card" style="margin-bottom:16px"><div class="card-head"><h2>Your subscriptions</h2></div>
+        ${rows.length ? `<div class="table-wrap"><table><thead><tr><th>Name</th><th class="r">Amount</th><th>Next charge</th><th class="r hide-sm">Per month</th><th class="hide-sm"></th></tr></thead><tbody>${rows.map((x) => {
+          const nd = C.nextCharge(x.nextDate, x.cadence, today);
+          return `<tr><td><b>${esc(x.name)}</b><div class="muted" style="font-size:.8rem">${esc(x.category)}</div><div class="show-sm"><button class="btn sm" data-action="edit-sub" data-id="${x.id}">Edit</button><button class="btn sm" data-action="toggle-sub" data-id="${x.id}">Cancelled it</button></div></td><td class="r num">${money(x.amount)}<div class="muted" style="font-size:.8rem">${cadenceLabel(x.cadence)}</div></td>
+            <td style="white-space:nowrap">${dateLabel(nd)}<div class="muted" style="font-size:.8rem">${dueIn(nd)}</div></td><td class="r num hide-sm">${money(C.monthlyCost(x.amount, x.cadence))}</td>
+            <td class="r acts hide-sm"><button class="btn sm" data-action="edit-sub" data-id="${x.id}">Edit</button> <button class="btn sm" data-action="toggle-sub" data-id="${x.id}">Cancelled it</button></td></tr>`; }).join('')}</tbody></table></div>`
+          : '<p class="muted">Nothing tracked yet. Add one above or track a detected charge.</p>'}</section>
+      ${upcoming.length ? `<section class="card" style="margin-bottom:16px"><h2 style="margin-bottom:8px">Coming up (next 30 days)</h2><table>${upcoming.sort((a, b) => a.d.localeCompare(b.d)).map((u) => `<tr><td class="muted" style="white-space:nowrap">${dateLabel(u.d)}</td><td>${esc(u.x.name)}</td><td class="muted">${dueIn(u.d)}</td><td class="r num">${money(u.x.amount)}</td></tr>`).join('')}</table></section>` : ''}
+      ${cancelled.length ? `<section class="card"><h2 style="margin-bottom:8px">Cancelled</h2><table>${cancelled.map((x) => `<tr><td>${esc(x.name)}</td><td class="r num muted">${money(x.amount)} ${cadenceLabel(x.cadence)}</td><td class="r"><span class="pos num">saves ${money0(C.monthlyCost(x.amount, x.cadence) * 12)}/yr</span></td><td class="r"><button class="btn sm" data-action="toggle-sub" data-id="${x.id}">Reactivate</button> <button class="btn sm danger" data-action="del-sub" data-id="${x.id}" aria-label="Delete">✕</button></td></tr>`).join('')}</table></section>` : ''}`;
   }
 
   /* reports */
@@ -477,6 +520,20 @@
     });
   }
 
+
+  function subForm(x) {
+    openModal(x ? 'Edit subscription' : 'Add subscription', `${fld('Name', 'name', x?.name, 'required placeholder="Netflix"')}
+      <div class="field-row">${fld('Amount ($)', 'amount', x?.amount ?? '', 'type="number" min="0.01" step="0.01" required inputmode="decimal"')}<label>Billed<select name="cadence">${CADENCE_OPTS(x?.cadence || 'monthly')}</select></label></div>
+      <div class="field-row">${fld('Next (or any) charge date', 'date', x?.nextDate || todayISO(), 'type="date" required')}<label>Category<select name="cat">${catOptions(x?.category || 'Subscriptions')}</select></label></div>
+      ${x ? `<p><button type="button" class="link danger" id="delSub">Delete this subscription</button></p>` : ''}`, (fd) => {
+      const name = fd.get('name').trim();
+      const data = { name, amount: Math.round(parseFloat(fd.get('amount')) * 100) / 100, cadence: fd.get('cadence'), nextDate: fd.get('date'), category: fd.get('cat') };
+      if (x) Object.assign(x, data); else state.subs.push({ id: uid(), key: normName(name), status: 'active', source: 'manual', ...data });
+      save(); render(); toast(x ? 'Subscription updated' : 'Subscription added');
+    }, { onOpen: (form) => { const del = $('#delSub', form); if (del) del.onclick = () => { if (confirm(`Delete “${x.name}”?`)) { state.subs = state.subs.filter((y) => y !== x); save(); modal.close(); render(); } }; } });
+  }
+  const trackDetected = (d) => state.subs.push({ id: uid(), key: d.key, name: d.name, amount: d.amount, cadence: d.cadence, nextDate: d.nextDate || d.lastDate, category: d.category, status: d.active ? 'active' : 'cancelled', source: 'detected' });
+
   function bucketForm(b) {
     openModal(b ? 'Edit bucket' : 'New savings bucket', `${fld('Name', 'name', b?.name, 'required placeholder="Emergency fund"')}
       <div class="field-row">${fld('Goal ($)', 'goal', b?.goal ?? '', 'type="number" min="1" step="1" required')}${fld('Already saved ($)', 'saved', b?.saved ?? 0, 'type="number" min="0" step="0.01"')}${fld('Monthly contribution ($, optional)', 'monthly', b?.monthly ?? '', 'type="number" min="0" step="1"')}</div>
@@ -545,7 +602,7 @@
     for (let k = 3; k >= 0; k--) {
       const ym = C.addMonths(now, -k), day = (n) => `${ym}-${String(Math.min(28, n)).padStart(2, '0')}`;
       out.push([day(1), 'ACME CORP PAYROLL', 3150], [day(15), 'ACME CORP PAYROLL', 3150], [day(1), 'Rent - Maple Apartments', -1450], [day(5), 'City Electric', -(70 + rnd() * 50)], [day(7), 'Comcast Internet', -69.99], [day(9), 'Verizon Wireless', -55],
-        [day(3), 'Netflix', -15.49], [day(3), 'Spotify', -10.99], [day(12), 'Planet Fitness gym', -24.99], [day(10), 'Navient Student Loan', -215], [day(11), 'Toyota Financial Auto Loan', -389]);
+        [day(3), 'Netflix', -15.49], [day(3), 'Spotify', -10.99], [day(12), 'Planet Fitness gym', -24.99], [day(8), 'Adobe Creative Cloud', -22.99], [day(14), 'iCloud storage', -2.99], [day(10), 'Navient Student Loan', -215], [day(11), 'Toyota Financial Auto Loan', -389]);
       for (let i = 0; i < 6; i++) out.push([day(2 + i * 5), pick(['Kroger #112', 'Whole Foods Market', 'Trader Joes', 'Aldi']), -(45 + rnd() * 90)]);
       for (let i = 0; i < 9; i++) out.push([day(1 + i * 3), pick(['Starbucks', 'Chipotle', 'DoorDash', 'Local Pizza Co', 'Dunkin']), -(6 + rnd() * 28)]);
       for (let i = 0; i < 4; i++) out.push([day(4 + i * 7), pick(['Shell Gas Station', 'Chevron', 'Uber trip']), -(20 + rnd() * 35)]);
@@ -588,6 +645,13 @@
     'add-tx': txForm,
     'add-bucket': () => bucketForm(),
     'add-debt': () => debtForm(),
+    'add-sub': () => subForm(),
+    'edit-sub': (el) => subForm(find(state.subs, el.dataset.id)),
+    'toggle-sub': (el) => { const x = find(state.subs, el.dataset.id); x.status = x.status === 'cancelled' ? 'active' : 'cancelled'; save(); render(); toast(x.status === 'cancelled' ? `Marked ${x.name} as cancelled 🎉` : `${x.name} is active again`); },
+    'del-sub': (el) => { const x = find(state.subs, el.dataset.id); if (confirm(`Delete “${x.name}”?`)) { state.subs = state.subs.filter((y) => y !== x); save(); render(); } },
+    'track-sub': (el) => { const d = detectedSubs().find((y) => y.key === el.dataset.key); if (d) { trackDetected(d); save(); render(); } },
+    'track-all': () => { const list = detectedSubs(); list.forEach(trackDetected); save(); render(); toast(`Tracking ${list.length} subscriptions`); },
+    'ignore-sub': (el) => { (state.ignoredSubs ||= []).push(el.dataset.key); save(); render(); toast('Ignored – it won’t be suggested again'); },
     sample: loadSample,
     print: () => window.print(),
     budgets: budgetsForm,

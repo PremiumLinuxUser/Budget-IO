@@ -178,3 +178,10 @@ body.dragging .dropzone-hint, body.dragging { outline: 3px dashed var(--brand); 
 
 body.locked main, body.locked .topbar nav, body.locked .top-actions { visibility: hidden; }
 .foot-links { flex-wrap: wrap; }
+
+.acts { white-space: nowrap; }
+.show-sm { display: none; }
+@media (max-width: 640px) {
+  .hide-sm { display: none; }
+  .show-sm { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+}
