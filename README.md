@@ -43,6 +43,9 @@ tests/            unit tests for core.js
 
 - **No network access.** A Content-Security-Policy in `index.html` blocks every outgoing connection and any script that isn't one of the app's own files, and the app loads nothing from third parties. Your data cannot be sent anywhere.
 - **Optional passphrase lock.** Use *Set passphrase* in the footer to encrypt everything stored in the browser (AES-256-GCM, key derived with PBKDF2, 310,000 iterations). The key is kept only in memory; the app re-locks after 10 idle minutes or when you tap *Lock now*. Backups are encrypted too. **There is no recovery if you forget the passphrase.** This also protects the data from other sites on the same `github.io` account, which share browser storage.
+- **Passphrase strength meter.** Weak passphrases (like `password1`) are rejected; four random words is the recommended pattern.
+- **Backup reminder.** A banner appears if you have data but no backup in the last 30 days (snooze for a week).
+- **Delete-your-CSV reminder.** After each import you're prompted to delete the downloaded bank file from Downloads and any synced cloud folder.
 - **Keep real data out of git.** `.gitignore` excludes `*.csv` (except the sample) and `budget-io-backup*.json`. Never commit bank exports or backups, especially to a public repo.
 - **Protect the repo.** Anyone who can push to `main` controls the code that runs on your devices: enable two-factor authentication on your GitHub account and don't add collaborators you wouldn't trust with your finances.
 - The passphrase lock needs HTTPS or `localhost` (or opening the file directly) because browsers only provide encryption APIs in secure contexts; GitHub Pages is HTTPS.

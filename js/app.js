@@ -85,6 +85,7 @@
     $('#modalTitle').textContent = title;
     $('#modalBody').innerHTML = `${body}<div class="modal-actions">${opts.persistent ? '' : '<button type="button" class="btn" data-close>Cancel</button>'}${opts.noSubmit ? '' : `<button class="btn primary" type="submit">${opts.submit || 'Save'}</button>`}</div>`;
     const form = $('#modalForm');
+    form.onchange = null; // drop handlers left by a previous dialog
     form.onsubmit = async (e) => {
       e.preventDefault();
       const res = await (onSubmit && onSubmit(new FormData(form), form));
@@ -207,8 +208,18 @@
 
   function render() {
     $$('#tabs button').forEach((b) => (b.getAttribute('data-tab') === ui.tab ? b.setAttribute('aria-current', 'page') : b.removeAttribute('aria-current')));
-    $('#view').innerHTML = views[ui.tab]();
+    $('#view').innerHTML = backupBanner() + views[ui.tab]();
     animateJars();
+  }
+  const SNOOZE_DAYS = 7, STALE_DAYS = 30;
+  const daysAgo = (iso) => (iso ? (Date.now() - Date.parse(iso + 'T12:00:00')) / 864e5 : Infinity);
+  function backupBanner() {
+    if (isEmpty()) return '';
+    const s = state.settings;
+    if (daysAgo(s.lastBackup) < STALE_DAYS || daysAgo(s.snoozedAt) < SNOOZE_DAYS) return '';
+    const msg = s.lastBackup ? `Your last backup was ${Math.floor(daysAgo(s.lastBackup))} days ago.` : 'You haven’t made a backup yet.';
+    return `<div class="notice no-print" role="region" aria-label="Backup reminder">💾 <b>Back up your data.</b> ${msg} Browsers can clear stored data (and a forgotten passphrase can’t be recovered).
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap"><button class="btn sm primary" data-action="export-json">Back up now</button><button class="btn sm" data-action="snooze-backup">Remind me in a week</button></div></div>`;
   }
   function go(tab) { ui.tab = tab; render(); window.scrollTo(0, 0); try { history.replaceState(null, '', '#' + tab); } catch { /* ignore */ } }
 
@@ -446,7 +457,13 @@
       current.fresh.forEach((t) => state.transactions.push({ id: uid(), ...t }));
       save(); ui.tx.month = 'all'; ui.month = current.fresh.map((t) => C.monthOf(t.date)).sort().pop();
       toast(`Imported ${current.fresh.length} transactions`); go('reports');
-    }, { submit: 'Import', noFocus: true, onOpen: (form) => { form.addEventListener('change', () => compute(form)); compute(form); } });
+      if (!state.settings.hideCsvReminder) setTimeout(csvReminder, 80);
+    }, { submit: 'Import', noFocus: true, onOpen: (form) => { form.onchange = () => compute(form); compute(form); } });
+  }
+
+  function csvReminder() {
+    openModal('Imported! One more step 🧹', `<p style="margin-top:0">The CSV you just uploaded still sits on your device, often in <b>Downloads</b>, which may sync to iCloud, OneDrive or Google Drive. It contains your raw bank data, so <b>delete it now</b> (and empty the trash / “Recently deleted”).</p>
+      <label class="check"><input type="checkbox" name="hide"> Don’t remind me again</label>`, (fd) => { if (fd.get('hide')) { state.settings.hideCsvReminder = true; save(); } }, { submit: 'Got it' });
   }
 
   /* ---------- forms ---------- */
@@ -665,23 +682,42 @@
     document.body.classList.remove('locked');
   }
 
+  /* Rough strength estimate (bits). Deliberately conservative: repeated characters and common passwords score low. */
+  function passStrength(p) {
+    if (!p) return { bits: 0, level: 0, label: '' };
+    let pool = 0;
+    if (/[a-z]/.test(p)) pool += 26; if (/[A-Z]/.test(p)) pool += 26; if (/\d/.test(p)) pool += 10; if (/[^A-Za-z0-9]/.test(p)) pool += 33;
+    const effLen = Math.min(p.length, new Set(p.toLowerCase()).size * 3);
+    let bits = effLen * Math.log2(Math.max(pool, 2)) * 0.8;
+    if (/^(password|passw0rd|qwerty|letmein|welcome|iloveyou|123456|abc123|budget)/i.test(p) || /^(.)\1+$/.test(p)) bits = Math.min(bits, 15);
+    return bits < 45 ? { bits, level: 1, label: 'Too weak' } : bits < 70 ? { bits, level: 2, label: 'Okay' } : { bits, level: 3, label: 'Strong' };
+  }
+
   function setLockForm() {
     openModal(cryptoKey ? 'Change passphrase' : 'Lock with a passphrase', `<p class="muted" style="margin-top:0">Your data will be encrypted (AES-256) in this browser and you'll need the passphrase each time you open the app or after 10 idle minutes.</p>
       <div class="notice"><b>There is no recovery.</b> If you forget the passphrase, the data can't be read. Make a backup first.</div>
-      ${fld('New passphrase (8+ characters)', 'p1', '', 'type="password" minlength="8" required autocomplete="new-password"')}<div style="height:10px"></div>${fld('Repeat passphrase', 'p2', '', 'type="password" minlength="8" required autocomplete="new-password"')}
+      ${fld('New passphrase (8+ characters)', 'p1', '', 'type="password" minlength="8" required autocomplete="new-password"')}
+      <div class="bar" style="margin-top:8px" aria-hidden="true"><i id="strengthBar" style="width:0"></i></div><div id="strengthTxt" class="muted" style="font-size:.82rem;min-height:1.3em" aria-live="polite">Tip: use 4+ random words, e.g. “maple rocket violin sandwich”.</div><div style="height:6px"></div>${fld('Repeat passphrase', 'p2', '', 'type="password" minlength="8" required autocomplete="new-password"')}
       <div class="neg" id="passErr" role="alert" style="min-height:1.4em;margin-top:6px"></div>`, async (fd, form) => {
+      if (passStrength(fd.get('p1')).level < 2) { $('#passErr', form).textContent = 'That passphrase is too easy to guess. Try a longer one, such as four random words.'; return false; }
       if (fd.get('p1') !== fd.get('p2')) { $('#passErr', form).textContent = 'The passphrases do not match.'; return false; }
       const salt = crypto.getRandomValues(new Uint8Array(16));
       cryptoKey = await deriveKey(fd.get('p1'), salt); cryptoSalt = salt;
       save(); await writeChain; updateLockUI(); toast('🔒 Data encrypted');
-    }, { submit: 'Enable lock' });
+    }, { submit: 'Enable lock', onOpen: (form) => {
+      form.elements.p1.addEventListener('input', () => {
+        const r = passStrength(form.elements.p1.value), bar = $('#strengthBar', form);
+        bar.style.width = `${Math.min(100, (r.bits / 90) * 100)}%`; bar.style.background = ['', 'var(--bad)', 'var(--warn)', 'var(--brand)'][r.level] || '';
+        $('#strengthTxt', form).textContent = r.label;
+      });
+    } });
   }
 
   async function exportBackup() {
-    const text = JSON.stringify(state, null, 2);
-    if (!cryptoKey) return download(`budget-io-backup-${todayISO()}.json`, text, 'application/json');
-    const p = await encryptText(JSON.stringify(state), cryptoKey, cryptoSalt);
-    download(`budget-io-backup-${todayISO()}-encrypted.json`, JSON.stringify(p), 'application/json');
+    if (!cryptoKey) download(`budget-io-backup-${todayISO()}.json`, JSON.stringify(state, null, 2), 'application/json');
+    else download(`budget-io-backup-${todayISO()}-encrypted.json`, JSON.stringify(await encryptText(JSON.stringify(state), cryptoKey, cryptoSalt)), 'application/json');
+    state.settings.lastBackup = todayISO(); save(); render();
+    toast(cryptoKey ? 'Encrypted backup downloaded – keep it somewhere safe.' : 'Backup downloaded. It is NOT encrypted – store it carefully and delete it after moving it.');
   }
 
   async function restoreBackup(text) {
@@ -700,6 +736,7 @@
   Object.assign(actions, {
     'export-json': exportBackup,
     'set-lock': setLockForm,
+    'snooze-backup': () => { state.settings.snoozedAt = todayISO(); save(); render(); },
     'lock-now': async () => { await writeChain; location.reload(); },
     'remove-lock': async () => {
       if (!confirm('Remove the passphrase? Your data will be stored unencrypted in this browser.')) return;
