@@ -109,4 +109,42 @@ t('splitPayment', () => {
   const s2 = C.splitPayment(100, 12, 500);
   assert.strictEqual(s2.newBalance, 0);
 });
+t('detectRecurring finds monthly, weekly, yearly, ignores variable & one-off', () => {
+  const tx = [];
+  const add = (date, desc, amount, category = 'Subscriptions') => tx.push({ date, desc, amount, category });
+  ['2026-08-03', '2026-09-03', '2026-10-03', '2026-11-03'].forEach((d) => { add(d, 'NETFLIX.COM 123', -15.49); add(d, 'Spotify USA', -10.99); });
+  ['2026-08-05', '2026-09-09', '2026-10-04'].forEach((d, i) => add(d, 'City Electric', -[70, 120, 95][i], 'Utilities')); // variable
+  ['2026-10-01', '2026-10-08', '2026-10-15', '2026-10-22'].forEach((d) => add(d, 'Meal Kit Co', -59, 'Shopping'));
+  add('2025-11-10', 'Amazon Prime Membership', -139, 'Shopping'); add('2026-11-10', 'Amazon Prime Membership', -139, 'Shopping');
+  add('2026-11-01', 'Rent - Maple', -1450, 'Housing'); add('2026-10-01', 'Rent - Maple', -1450, 'Housing');
+  add('2026-09-09', 'Random Gadget', -49, 'Shopping');
+  add('2026-10-03', 'Netflix Special', -4.99); // different amount, same merchant
+  add('2026-09-22', 'CVS Pharmacy', -14.2, 'Health'); add('2026-10-22', 'CVS Pharmacy', -26.9, 'Health'); // two similar-ish monthly purchases
+  const r = C.detectRecurring(tx, '2026-11-16');
+  const by = Object.fromEntries(r.map((x) => [x.key, x]));
+  assert.strictEqual(by['netflix com'].cadence, 'monthly');
+  assert.strictEqual(by['netflix com'].amount, 15.49);
+  assert.strictEqual(by['netflix com'].nextDate, '2026-12-03');
+  assert.strictEqual(by['spotify usa'].count, 4);
+  assert.strictEqual(by['meal kit'].cadence, 'weekly');
+  assert.strictEqual(by['meal kit'].active, false); // last charge Oct 22, 25 days ago > 7*1.6
+  assert.strictEqual(by['amazon prime'].cadence, 'yearly');
+  assert.strictEqual(by['amazon prime'].nextDate, '2027-11-10');
+  assert.strictEqual(by['amazon prime'].monthlyCost, 11.58);
+  assert.ok(!by['city electric'], 'variable bill not a subscription');
+  assert.ok(!by['rent maple'], 'housing excluded');
+  assert.ok(!by['random gadget'], 'one-off ignored');
+  assert.ok(!by['cvs pharmacy'], 'two different-amount charges are not enough');
+  assert.strictEqual(C.categorize('CVS Pharmacy', -10), 'Health');
+  assert.strictEqual(C.categorize("Macy's", -10), 'Shopping');
+});
+t('charge dates: next, between, month-end clamp, monthlyCost', () => {
+  assert.strictEqual(C.nextCharge('2026-01-31', 'monthly', '2026-03-01'), '2026-03-31');
+  assert.strictEqual(C.nextCharge('2026-01-31', 'monthly', '2026-02-10'), '2026-02-28');
+  assert.deepStrictEqual(C.chargesBetween('2026-11-02', 'weekly', '2026-11-16', '2026-12-16'), ['2026-11-16', '2026-11-23', '2026-11-30', '2026-12-07', '2026-12-14']);
+  assert.strictEqual(C.nextCharge('2026-11-16', 'yearly', '2026-11-16'), '2026-11-16');
+  assert.strictEqual(C.monthlyCost(120, 'yearly'), 10);
+  assert.strictEqual(C.monthlyCost(12, 'weekly'), 52);
+  assert.strictEqual(C.daysBetween('2026-02-28', '2026-03-01'), 1);
+});
 console.log(`\n${n} tests passed`);
