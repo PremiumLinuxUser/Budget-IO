@@ -37,14 +37,36 @@
   /* ---------- state ---------- */
   const KEY = 'budgetio.v1';
   const blank = () => ({ transactions: [], buckets: [], debts: [], rules: {}, budgets: {}, settings: { extra: 0, strategy: 'avalanche' } });
-  let state;
-  try { state = Object.assign(blank(), JSON.parse(localStorage.getItem(KEY) || '{}')); } catch { state = blank(); }
-  state.settings = Object.assign({ extra: 0, strategy: 'avalanche' }, state.settings);
-  let saveWarned = false;
+  let state = blank();
+
+  /* Optional passphrase lock: AES-256-GCM, key derived with PBKDF2 (WebCrypto). The key lives only in memory. */
+  const HAS_CRYPTO = !!(window.crypto && crypto.subtle);
+  let cryptoKey = null, cryptoSalt = null;
+  const toB64 = (buf) => { const u = new Uint8Array(buf); let s = ''; for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(s); };
+  const fromB64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+  async function deriveKey(pass, salt) {
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pass), 'PBKDF2', false, ['deriveKey']);
+    return crypto.subtle.deriveKey({ name: 'PBKDF2', salt, iterations: 310000, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+  }
+  async function encryptText(text, key, salt) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, new TextEncoder().encode(text));
+    return { budgetio: 'encrypted-v1', salt: toB64(salt), iv: toB64(iv), data: toB64(ct) };
+  }
+  async function decryptPayload(p, key) {
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromB64(p.iv) }, key, fromB64(p.data));
+    return JSON.parse(new TextDecoder().decode(pt));
+  }
+  const isEncrypted = (p) => p && p.budgetio === 'encrypted-v1' && p.salt && p.iv && p.data;
+
+  let saveWarned = false, writeChain = Promise.resolve();
+  const warnSave = () => { if (!saveWarned) { saveWarned = true; toast('Could not save – browser storage is unavailable. Use “Back up data”.'); } };
   const save = () => {
-    try { localStorage.setItem(KEY, JSON.stringify(state)); }
-    catch { if (!saveWarned) { saveWarned = true; toast('Could not save – browser storage is unavailable. Use “Back up data”.'); } }
+    if (!cryptoKey) { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch { warnSave(); } return; }
+    const text = JSON.stringify(state), key = cryptoKey, salt = cryptoSalt; // snapshot now, write in order
+    writeChain = writeChain.then(async () => { localStorage.setItem(KEY, JSON.stringify(await encryptText(text, key, salt))); }).catch(warnSave);
   };
+  const normalizeState = () => { state = Object.assign(blank(), state); state.settings = Object.assign({ extra: 0, strategy: 'avalanche' }, state.settings); };
 
   const ui = { tab: 'dashboard', month: null, tx: { q: '', month: 'all', cat: 'all', limit: 100 }, lastPct: {} };
   const months = () => [...new Set(state.transactions.map((t) => C.monthOf(t.date)))].sort().reverse();
@@ -57,16 +79,18 @@
     clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 3600);
   }
   const modal = $('#modal');
+  let modalPersistent = false; // the unlock dialog can't be dismissed
   function openModal(title, body, onSubmit, opts = {}) {
+    modalPersistent = !!opts.persistent;
     $('#modalTitle').textContent = title;
-    $('#modalBody').innerHTML = `${body}<div class="modal-actions"><button type="button" class="btn" data-close>Cancel</button>${opts.noSubmit ? '' : `<button class="btn primary" type="submit">${opts.submit || 'Save'}</button>`}</div>`;
+    $('#modalBody').innerHTML = `${body}<div class="modal-actions">${opts.persistent ? '' : '<button type="button" class="btn" data-close>Cancel</button>'}${opts.noSubmit ? '' : `<button class="btn primary" type="submit">${opts.submit || 'Save'}</button>`}</div>`;
     const form = $('#modalForm');
-    form.onsubmit = (e) => {
+    form.onsubmit = async (e) => {
       e.preventDefault();
-      const res = onSubmit && onSubmit(new FormData(form), form);
+      const res = await (onSubmit && onSubmit(new FormData(form), form));
       if (res !== false) modal.close();
     };
-    $('[data-close]', form).onclick = () => modal.close();
+    const closeBtn = $('[data-close]', form); if (closeBtn) closeBtn.onclick = () => modal.close();
     modal.showModal();
     const first = $('input:not([type=hidden]):not([type=checkbox]), select', form);
     if (first && !opts.noFocus) first.focus();
@@ -551,9 +575,7 @@
     print: () => window.print(),
     budgets: budgetsForm,
     'export-report': exportReport,
-    'export-json': () => download(`budget-io-backup-${todayISO()}.json`, JSON.stringify(state, null, 2), 'application/json'),
     'import-json': () => $('#jsonFile').click(),
-    reset: () => { if (confirm('Delete ALL Budget IO data in this browser? This cannot be undone.')) { state = blank(); ui.lastPct = {}; save(); go('dashboard'); toast('All data cleared'); } },
     deposit: (el) => moveMoney(find(state.buckets, el.dataset.id), 1),
     withdraw: (el) => moveMoney(find(state.buckets, el.dataset.id), -1),
     'edit-bucket': (el) => bucketForm(find(state.buckets, el.dataset.id)),
@@ -595,23 +617,121 @@
   $('#jsonFile').addEventListener('change', (e) => {
     const f = e.target.files[0]; e.target.value = ''; if (!f) return;
     const r = new FileReader();
-    r.onload = () => {
-      try {
-        const data = JSON.parse(r.result);
-        if (!Array.isArray(data.transactions) || !Array.isArray(data.buckets) || !Array.isArray(data.debts)) throw new Error('bad shape');
-        if (!confirm('Replace all current data with this backup?')) return;
-        state = Object.assign(blank(), data); ui.lastPct = {}; save(); go('dashboard'); toast('Backup restored');
-      } catch { toast('That does not look like a Budget IO backup.'); }
-    };
+    r.onload = () => restoreBackup(String(r.result));
     r.readAsText(f);
   });
   // drag & drop CSV anywhere
   ['dragenter', 'dragover'].forEach((ev) => window.addEventListener(ev, (e) => { if ([...(e.dataTransfer?.types || [])].includes('Files')) { e.preventDefault(); document.body.classList.add('dragging'); } }));
   ['dragleave', 'drop'].forEach((ev) => window.addEventListener(ev, (e) => { if (ev === 'dragleave' && e.relatedTarget) return; document.body.classList.remove('dragging'); }));
   window.addEventListener('drop', (e) => { const f = e.dataTransfer?.files?.[0]; if (f) { e.preventDefault(); if (/\.(csv|txt)$/i.test(f.name) || f.type.includes('csv')) startImport(f); else toast('Please drop a .csv file.'); } });
-  modal.addEventListener('click', (e) => { if (e.target === modal) modal.close(); });
+  modal.addEventListener('click', (e) => { if (e.target === modal && !modalPersistent) modal.close(); });
+  modal.addEventListener('cancel', (e) => { if (modalPersistent) e.preventDefault(); });
+  modal.addEventListener('close', () => { modalPersistent = false; });
 
-  const hash = location.hash.slice(1);
-  if (views[hash]) ui.tab = hash;
-  render();
+  /* ---------- passphrase lock ---------- */
+  function updateLockUI() {
+    const locked = !!cryptoKey;
+    $('#lockBtn').hidden = !HAS_CRYPTO;
+    $('#lockBtn').textContent = locked ? 'Change passphrase' : '🔒 Set passphrase';
+    $('#lockNowBtn').hidden = !locked;
+    $('#unlockRemoveBtn').hidden = !locked;
+  }
+
+  function askPassphrase(title, intro, check) {
+    return new Promise((resolve) => {
+      openModal(title, `<p class="muted" style="margin-top:0">${intro}</p>${fld('Passphrase', 'pass', '', 'type="password" required autocomplete="current-password"')}<div class="neg" id="passErr" role="alert" style="min-height:1.4em;margin-top:6px"></div>`,
+        async (fd, form) => {
+          try { const out = await check(fd.get('pass')); resolve(out); }
+          catch { $('#passErr', form).textContent = 'Wrong passphrase – try again.'; return false; }
+        }, { submit: 'Unlock' });
+      modal.addEventListener('close', function once() { modal.removeEventListener('close', once); resolve(null); }, { once: true });
+    });
+  }
+
+  async function bootUnlock(payload) {
+    document.body.classList.add('locked');
+    await new Promise((resolve) => {
+      openModal('Budget IO is locked', `<p class="muted" style="margin-top:0">Enter your passphrase to decrypt your data on this device.</p>${fld('Passphrase', 'pass', '', 'type="password" required autocomplete="current-password"')}
+        <div class="neg" id="passErr" role="alert" style="min-height:1.4em;margin-top:6px"></div>
+        <p style="margin-bottom:0"><button type="button" class="link danger" id="eraseAll">Forgot it? Erase all data</button></p>`, async (fd, form) => {
+        try {
+          const salt = fromB64(payload.salt), key = await deriveKey(fd.get('pass'), salt);
+          state = await decryptPayload(payload, key); cryptoKey = key; cryptoSalt = salt; resolve();
+        } catch { $('#passErr', form).textContent = 'Wrong passphrase – try again.'; return false; }
+      }, { submit: 'Unlock', persistent: true, onOpen: (form) => {
+        $('#eraseAll', form).onclick = () => { if (confirm('This permanently deletes everything stored in this browser, since it cannot be decrypted without the passphrase. Continue?')) { try { localStorage.removeItem(KEY); } catch { /* ignore */ } state = blank(); modal.close(); resolve(); } };
+      } });
+    });
+    document.body.classList.remove('locked');
+  }
+
+  function setLockForm() {
+    openModal(cryptoKey ? 'Change passphrase' : 'Lock with a passphrase', `<p class="muted" style="margin-top:0">Your data will be encrypted (AES-256) in this browser and you'll need the passphrase each time you open the app or after 10 idle minutes.</p>
+      <div class="notice"><b>There is no recovery.</b> If you forget the passphrase, the data can't be read. Make a backup first.</div>
+      ${fld('New passphrase (8+ characters)', 'p1', '', 'type="password" minlength="8" required autocomplete="new-password"')}<div style="height:10px"></div>${fld('Repeat passphrase', 'p2', '', 'type="password" minlength="8" required autocomplete="new-password"')}
+      <div class="neg" id="passErr" role="alert" style="min-height:1.4em;margin-top:6px"></div>`, async (fd, form) => {
+      if (fd.get('p1') !== fd.get('p2')) { $('#passErr', form).textContent = 'The passphrases do not match.'; return false; }
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      cryptoKey = await deriveKey(fd.get('p1'), salt); cryptoSalt = salt;
+      save(); await writeChain; updateLockUI(); toast('🔒 Data encrypted');
+    }, { submit: 'Enable lock' });
+  }
+
+  async function exportBackup() {
+    const text = JSON.stringify(state, null, 2);
+    if (!cryptoKey) return download(`budget-io-backup-${todayISO()}.json`, text, 'application/json');
+    const p = await encryptText(JSON.stringify(state), cryptoKey, cryptoSalt);
+    download(`budget-io-backup-${todayISO()}-encrypted.json`, JSON.stringify(p), 'application/json');
+  }
+
+  async function restoreBackup(text) {
+    let data;
+    try { data = JSON.parse(text); } catch { return toast('That does not look like a Budget IO backup.'); }
+    if (isEncrypted(data)) {
+      if (!HAS_CRYPTO) return toast('This browser cannot decrypt backups (needs HTTPS or localhost).');
+      data = await askPassphrase('Encrypted backup', 'Enter the passphrase this backup was encrypted with.', async (pass) => decryptPayload(data, await deriveKey(pass, fromB64(data.salt))));
+      if (!data) return;
+    }
+    if (!Array.isArray(data.transactions) || !Array.isArray(data.buckets) || !Array.isArray(data.debts)) return toast('That does not look like a Budget IO backup.');
+    if (!confirm('Replace all current data with this backup?')) return;
+    state = data; normalizeState(); ui.lastPct = {}; save(); go('dashboard'); toast('Backup restored');
+  }
+
+  Object.assign(actions, {
+    'export-json': exportBackup,
+    'set-lock': setLockForm,
+    'lock-now': async () => { await writeChain; location.reload(); },
+    'remove-lock': async () => {
+      if (!confirm('Remove the passphrase? Your data will be stored unencrypted in this browser.')) return;
+      await writeChain; cryptoKey = null; cryptoSalt = null; save(); updateLockUI(); toast('Passphrase removed');
+    },
+    reset: async () => {
+      if (!confirm('Delete ALL Budget IO data in this browser (including the passphrase)? This cannot be undone.')) return;
+      await writeChain; try { localStorage.removeItem(KEY); } catch { /* ignore */ }
+      cryptoKey = null; cryptoSalt = null; state = blank(); ui.lastPct = {}; updateLockUI(); go('dashboard'); toast('All data cleared');
+    },
+  });
+
+  // lock again after the tab has been hidden or idle for a while
+  const IDLE_MS = 10 * 60 * 1000;
+  let idleTimer, hiddenAt = 0;
+  const armIdle = () => { clearTimeout(idleTimer); if (cryptoKey) idleTimer = setTimeout(() => actions['lock-now'](), IDLE_MS); };
+  ['pointerdown', 'keydown', 'scroll'].forEach((ev) => window.addEventListener(ev, armIdle, { passive: true }));
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) hiddenAt = Date.now();
+    else if (cryptoKey && hiddenAt && Date.now() - hiddenAt > IDLE_MS) actions['lock-now']();
+  });
+
+  (async function boot() {
+    let parsed = {};
+    try { parsed = JSON.parse(localStorage.getItem(KEY) || '{}') || {}; } catch { parsed = {}; }
+    if (isEncrypted(parsed)) {
+      if (!HAS_CRYPTO) { $('#view').innerHTML = '<div class="card empty"><h3>Can’t unlock here</h3><p>Your data is encrypted and this browser blocks encryption on non-HTTPS pages. Open the https:// version of the app.</p></div>'; return; }
+      await bootUnlock(parsed);
+    } else state = parsed;
+    normalizeState(); updateLockUI(); armIdle();
+    const hash = location.hash.slice(1);
+    if (views[hash]) ui.tab = hash;
+    render();
+  })();
 })();

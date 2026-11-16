@@ -175,3 +175,6 @@ body.dragging .dropzone-hint, body.dragging { outline: 3px dashed var(--brand); 
 @media (max-width: 640px) {
   #tabs { order: 3; flex-basis: 100%; }
 }
+
+body.locked main, body.locked .topbar nav, body.locked .top-actions { visibility: hidden; }
+.foot-links { flex-wrap: wrap; }
